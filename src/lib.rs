@@ -5,6 +5,7 @@ mod proxy;
 use crate::config::Config;
 use crate::proxy::*;
 
+use std::collections::HashMap;
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use serde::Serialize;
 use serde_json::json;
@@ -21,23 +22,61 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .var("UUID")
         .map(|x| Uuid::parse_str(&x.to_string()).unwrap_or_default())?;
     let host = req.url()?.host().map(|x| x.to_string()).unwrap_or_default();
-    let config = Config { uuid, host: host.clone(), proxy_addr: host, proxy_port: 80};
+    let main_page_url = env.var("MAIN_PAGE_URL").map(|x|x.to_string()).unwrap();
+    let sub_page_url = env.var("SUB_PAGE_URL").map(|x|x.to_string()).unwrap();
+    let config = Config { uuid, host: host.clone(), proxy_addr: host, proxy_port: 443, main_page_url, sub_page_url};
 
     Router::with_data(config)
+        .on_async("/", fe)
+        .on_async("/sub", sub)
         .on("/link", link)
         .on_async("/:proxyip", tunnel)
         .run(req, env)
         .await
 }
 
+async fn get_response_from_url(url: String) -> Result<Response> {
+    let req = Fetch::Url(Url::parse(url.as_str())?);
+    let mut res = req.send().await?;
+    Response::from_html(res.text().await?)
+}
+
+async fn fe(_: Request, cx: RouteContext<Config>) -> Result<Response> {
+    get_response_from_url(cx.data.main_page_url).await
+}
+
+async fn sub(_: Request, cx: RouteContext<Config>) -> Result<Response> {
+    get_response_from_url(cx.data.sub_page_url).await
+}
+
+
 async fn tunnel(req: Request, mut cx: RouteContext<Config>) -> Result<Response> {
-    if let Some(proxyip) = cx.param("proxyip") {
-        if PROXYIP_PATTERN.is_match(proxyip) {
-            if let Some((addr, port_str)) = proxyip.split_once('-') {
-                if let Ok(port) = port_str.parse() {
-                    cx.data.proxy_addr = addr.to_string();
-                    cx.data.proxy_port = port;
-                }
+    let mut proxyip = cx.param("proxyip").unwrap().to_string();
+    if proxyip.len() == 2 {
+        let kv = cx.kv("SIREN")?;
+        let mut proxy_kv_str = kv.get("proxy_kv").text().await?.unwrap_or("".to_string());
+
+        if proxy_kv_str.len() == 0 {
+            console_log!("getting proxy kv from github...");
+            let req = Fetch::Url(Url::parse("https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json")?);
+            let mut res = req.send().await?;
+            if res.status_code() == 200 {
+                proxy_kv_str = res.text().await?.to_string();
+                kv.put("proxy_kv", &proxy_kv_str)?.expiration_ttl(60 * 60 * 24).execute().await?; // 24 hours
+            } else {
+                return Err(Error::from(format!("error getting proxy kv: {}", res.status_code())));
+            }
+        }
+        
+        let proxy_kv: HashMap<String, Vec<String>> = serde_json::from_str(&proxy_kv_str)?;
+        proxyip = proxy_kv[&proxyip][0].clone().replace(":", "-");
+    }
+
+    if PROXYIP_PATTERN.is_match(&proxyip) {
+        if let Some((addr, port_str)) = proxyip.split_once('-') {
+            if let Ok(port) = port_str.parse() {
+                cx.data.proxy_addr = addr.to_string();
+                cx.data.proxy_port = port;
             }
         }
     }
@@ -56,25 +95,25 @@ async fn tunnel(req: Request, mut cx: RouteContext<Config>) -> Result<Response> 
     
         Response::from_websocket(client)
     } else {
-        let req = Fetch::Url(Url::parse("https://example.com")?);
-        req.send().await
+        Response::from_html("hi from wasm!")
     }
+
 }
 
 fn link(_: Request, cx: RouteContext<Config>) -> Result<Response> {
     #[derive(Serialize)]
     struct Link {
-        description: String,
-        link: String,
+        links: [String; 4],
     }
 
-    let link = {
-        let host = cx.data.host.to_string();
-        let uuid = cx.data.uuid.to_string();
+    let host = cx.data.host.to_string();
+    let uuid = cx.data.uuid.to_string();
+
+    let vmess_link = {
         let config = json!({
-            "ps": "tunl",
+            "ps": "siren vmess",
             "v": "2",
-            "add": "162.159.16.149",
+            "add": host,
             "port": "80",
             "id": uuid,
             "aid": "0",
@@ -82,17 +121,23 @@ fn link(_: Request, cx: RouteContext<Config>) -> Result<Response> {
             "net": "ws",
             "type": "none",
             "host": host,
-            "path": "",
+            "path": "/KR",
             "tls": "",
             "sni": "",
             "alpn": ""}
         );
         format!("vmess://{}", URL_SAFE.encode(config.to_string()))
     };
-
+    let vless_link = format!("vless://{uuid}@{host}:443?encryption=none&type=ws&host={host}&path=%2FKR&security=tls&sni={host}#siren vless");
+    let trojan_link = format!("trojan://{uuid}@{host}:443?encryption=none&type=ws&host={host}&path=%2FKR&security=tls&sni={host}#siren trojan");
+    let ss_link = format!("ss://{}@{host}:443?plugin=v2ray-plugin%3Btls%3Bmux%3D0%3Bmode%3Dwebsocket%3Bpath%3D%2FKR%3Bhost%3D{host}#siren ss", URL_SAFE.encode(format!("none:{uuid}")));
+    
     Response::from_json(&Link {
-        link,
-        description:
-            "visit https://scanner.github1.cloud/ and replace the IP address in the configuration with a clean one".to_string()
+        links: [
+            vmess_link,
+            vless_link,
+            trojan_link,
+            ss_link
+        ],
     })
 }
