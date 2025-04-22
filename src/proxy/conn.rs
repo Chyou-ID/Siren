@@ -2,12 +2,15 @@ use crate::config::Config;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
-
 use bytes::{BufMut, BytesMut};
 use futures_util::Stream;
 use pin_project_lite::pin_project;
+use pretty_bytes::converter::convert;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use worker::*;
+
+static MAX_WEBSOCKET_SIZE: usize = 64 * 1024; // 64kb
+static MAX_BUFFER_SIZE: usize = 512 * 1024; // 512kb
 
 pin_project! {
     pub struct ProxyStream<'a> {
@@ -21,7 +24,7 @@ pin_project! {
 
 impl<'a> ProxyStream<'a> {
     pub fn new(config: Config, ws: &'a WebSocket, events: EventStream<'a>) -> Self {
-        let buffer = BytesMut::new();
+        let buffer = BytesMut::with_capacity(MAX_BUFFER_SIZE);
 
         Self {
             config,
@@ -52,7 +55,6 @@ impl<'a> ProxyStream<'a> {
                 }
             }
         }
-
         Ok(())
     }
 
@@ -62,29 +64,31 @@ impl<'a> ProxyStream<'a> {
     }
 
     pub async fn process(&mut self) -> Result<()> {
-        self.fill_buffer_until(62).await?;
-        let peeked_buffer = self.peek_buffer(62);
+        let peek_buffer_len = 62;
+        self.fill_buffer_until(peek_buffer_len).await?;
+        let peeked_buffer = self.peek_buffer(peek_buffer_len);
 
-        if peeked_buffer[0] == 0 {
-            console_log!("VLESS detected!");
-            self.process_vless().await
-        } else if peeked_buffer[0] == 1 || peeked_buffer[0] == 3 {
-            console_log!("Shadowsocks detected!");
-            self.process_shadowsocks().await
-        } else if peeked_buffer[56] == 13 && peeked_buffer[57] == 10 {
-            console_log!("Trojan detected!");
-            self.process_trojan().await
-        } else {
-            console_log!("Vmess detected!");
-            self.process_vmess().await
+        if peeked_buffer.len() < (peek_buffer_len/2) {
+            return Err(worker::Error::RustError("not enough buffer".to_string()));
         }
 
+        if peeked_buffer[0] == 0 {
+            console_log!("vless detected!");
+            self.process_vless().await
+        } else if peeked_buffer[0] == 1 || peeked_buffer[0] == 3 {
+            console_log!("shadowsocks detected!");
+            self.process_shadowsocks().await
+        } else if peeked_buffer.len() > 57 && peeked_buffer[56] == 13 && peeked_buffer[57] == 10 {
+            console_log!("trojan detected!");
+            self.process_trojan().await
+        } else {
+            console_log!("vmess detected!");
+            self.process_vmess().await
+        }
     }
 
     pub async fn handle_tcp_outbound(&mut self, addr: String, port: u16) -> Result<()> {
-        console_log!("connecting to upstream {}:{}", addr, port);
-
-        let mut remote_socket = Socket::builder().connect(addr, port).map_err(|e| {
+        let mut remote_socket = Socket::builder().connect(&addr, port).map_err(|e| {
             Error::RustError(e.to_string())
         })?;
 
@@ -94,6 +98,9 @@ impl<'a> ProxyStream<'a> {
 
         tokio::io::copy_bidirectional(self, &mut remote_socket)
             .await
+            .map(|(a_to_b, b_to_a)| {
+                console_log!("copied data from {}, up: {} and dl: {}", &addr, convert(a_to_b as f64), convert(b_to_a as f64));
+            })
             .map_err(|e| {
                 Error::RustError(e.to_string())
             })?;
@@ -129,7 +136,18 @@ impl<'a> AsyncRead for ProxyStream<'a> {
 
             match this.events.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
-                    msg.bytes().iter().for_each(|x| this.buffer.put_slice(&x));
+                    if let Some(data) = msg.bytes() {
+                        if data.len() > MAX_WEBSOCKET_SIZE {
+                            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "websocket buffer too long")))
+                        }
+                        
+                        if this.buffer.len() + data.len() > MAX_BUFFER_SIZE {
+                            console_log!("buffer full, applying backpressure");
+                            return Poll::Pending;
+                        }
+                        
+                        this.buffer.put_slice(&data);
+                    }
                 }
                 Poll::Pending => return Poll::Pending,
                 _ => return Poll::Ready(Ok(())),
@@ -157,6 +175,12 @@ impl<'a> AsyncWrite for ProxyStream<'a> {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<tokio::io::Result<()>> {
-        unimplemented!()
+        match self.ws.close(Some(1000), Some("shutdown".to_string())) {
+            Ok(_) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))),
+        }
     }
 }
